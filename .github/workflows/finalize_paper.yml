@@ -27,9 +27,11 @@ jobs:
   finalize:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout CDN repo
+      - name: Checkout Private Qrank repo
         uses: actions/checkout@v4
         with:
+          repository: TigerMask1/Qrank
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
           persist-credentials: true
 
       - name: Set up Python
@@ -44,11 +46,9 @@ jobs:
         env:
           CALLBACK_URL: ${{ secrets.QRANK_CALLBACK_URL }}
           CALLBACK_SECRET: ${{ secrets.QRANK_CALLBACK_SECRET }}
-          CDN_REPO: "TigerMask1/Qrank-CDN"
-          CDN_BRANCH: "main"
         run: python scripts/finalize_worker.py
 
-      - name: Commit results
+      - name: Commit results back to PRIVATE repo
         run: |
           git config user.name "qrank-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -65,5 +65,5 @@ jobs:
 
           git add -A pending_jobs/ || true
           git add -A processing_pages/ || true
-          git diff --cached --quiet || git commit -m "Finalize buffered papers"
+          git diff --cached --quiet || git commit -m "Finalize buffered papers (via CDN repo worker)"
           git push
