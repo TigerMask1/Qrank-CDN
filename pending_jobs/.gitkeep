@@ -1,0 +1,3 @@
+# This file intentionally kept to ensure the directory is tracked by git.
+# Pending finalization jobs are written here by the Qrank backend.
+# The finalize_paper.yml workflow processes all subdirectories in one run.

@@ -1,0 +1,69 @@
+name: Finalize Paper
+
+# Triggered by the Qrank backend (via GitHub API) once a student finishes
+# reviewing a paper. All the memory-heavy PDF rendering, cropping, and
+# stitching happens here on GitHub's runner (7GB RAM, free public minutes)
+# instead of on the 512MB Render box — that box only orchestrates.
+#
+# This runs on the PUBLIC Qrank-CDN repo so:
+#   1. No GitHub Actions minute limits (public repos get unlimited free minutes)
+#   2. Cropped images are immediately publicly accessible via raw.githubusercontent.com
+#   3. The private Qrank repo stays lightweight and secure
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: "The review project id (optional — processes all pending jobs)"
+        required: false
+
+concurrency:
+  group: process_pending_jobs
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout CDN repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet pillow requests
+
+      - name: Crop, stitch, and commit question images
+        env:
+          CALLBACK_URL: ${{ secrets.QRANK_CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.QRANK_CALLBACK_SECRET }}
+          CDN_REPO: "TigerMask1/Qrank-CDN"
+          CDN_BRANCH: "main"
+        run: python scripts/finalize_worker.py
+
+      - name: Commit results
+        run: |
+          git config user.name "qrank-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add questions_db/ || true
+
+          if [ -f processed_projects.txt ]; then
+            while IFS= read -r pid; do
+              git rm -r --cached "pending_jobs/$pid" 2>/dev/null || true
+              rm -rf "pending_jobs/$pid" || true
+              git rm -r --cached "processing_pages/$pid" 2>/dev/null || true
+              rm -rf "processing_pages/$pid" || true
+            done < processed_projects.txt
+          fi
+
+          git add -A pending_jobs/ || true
+          git add -A processing_pages/ || true
+          git diff --cached --quiet || git commit -m "Finalize buffered papers"
+          git push
