@@ -1,0 +1,62 @@
+name: Batch Book Extractor (AIRstudy)
+
+# Runs heavy 500+ page book processing on GitHub's free 7GB RAM runners
+# Does NOT save or commit image files to this repository.
+# All question assets are streamed directly to Backblaze B2 and indexed into Turso DB.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Batch Job ID'
+        required: true
+      pdf_url:
+        description: 'Public or pre-signed URL to the PDF'
+        required: true
+      total_pages:
+        description: 'Total number of pages to process'
+        required: false
+        default: '500'
+      start_page:
+        description: 'Starting page index (0-based)'
+        required: false
+        default: '0'
+      branch:
+        description: 'QRank branch to run code from'
+        required: false
+        default: 'feature/air-study-qmatch-upgrade'
+
+jobs:
+  extract_book:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Private QRank Repo
+        uses: actions/checkout@v4
+        with:
+          repository: TigerMask1/Qrank
+          ref: ${{ github.event.inputs.branch }}
+          token: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Ingestion Dependencies
+        run: |
+          pip install --quiet PyMuPDF Pillow google-genai boto3 requests
+
+      - name: Execute Autonomous Batch Ingestion
+        env:
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          B2_REGION: ${{ secrets.B2_REGION || 'us-west-004' }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          CALLBACK_URL: ${{ secrets.QRANK_CALLBACK_URL }}
+        run: |
+          python3 scripts/batch_pdf_worker.py             --job-id "${{ github.event.inputs.job_id }}"             --pdf-url "${{ github.event.inputs.pdf_url }}"             --total-pages "${{ github.event.inputs.total_pages }}"             --start-page "${{ github.event.inputs.start_page }}"
