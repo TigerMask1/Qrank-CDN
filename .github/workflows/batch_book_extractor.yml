@@ -11,7 +11,7 @@ on:
         description: 'Batch Job ID'
         required: true
       pdf_url:
-        description: 'Public or pre-signed URL to the PDF'
+        description: 'Public or pre-signed URL or repository filename'
         required: true
       total_pages:
         description: 'Total number of pages to process'
@@ -44,7 +44,7 @@ jobs:
 
       - name: Install Ingestion Dependencies
         run: |
-          pip install --quiet PyMuPDF Pillow google-genai boto3 requests
+          pip install --quiet PyMuPDF Pillow google-genai boto3 requests pypdf python-dotenv
 
       - name: Execute Autonomous Batch Ingestion
         env:
@@ -59,4 +59,8 @@ jobs:
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           CALLBACK_URL: ${{ secrets.QRANK_CALLBACK_URL }}
         run: |
-          python3 scripts/batch_pdf_worker.py             --job-id "${{ github.event.inputs.job_id }}"             --pdf-url "${{ github.event.inputs.pdf_url }}"             --total-pages "${{ github.event.inputs.total_pages }}"             --start-page "${{ github.event.inputs.start_page }}"
+          python3 scripts/batch_pdf_worker.py \
+            --job-id "${{ github.event.inputs.job_id }}" \
+            --pdf-url "${{ github.event.inputs.pdf_url }}" \
+            --total-pages "${{ github.event.inputs.total_pages }}" \
+            --start-page "${{ github.event.inputs.start_page }}"
