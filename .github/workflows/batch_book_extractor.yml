@@ -21,6 +21,10 @@ on:
         description: 'Starting page index (0-based)'
         required: false
         default: '0'
+      chunk_size:
+        description: 'Pages per chunk run (default: 150)'
+        required: false
+        default: '150'
       branch:
         description: 'QRank branch to run code from'
         required: false
@@ -36,6 +40,7 @@ jobs:
           repository: TigerMask1/Qrank
           ref: ${{ github.event.inputs.branch }}
           token: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
+          lfs: true
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -48,6 +53,8 @@ jobs:
 
       - name: Execute Autonomous Batch Ingestion
         env:
+          GEMINI_MODEL: 'gemini-3.5-flash-lite'
+          GEMINI_FALLBACK_MODEL: 'gemini-3.1-flash-lite'
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
@@ -56,6 +63,8 @@ jobs:
           B2_REGION: ${{ secrets.B2_REGION || 'us-west-004' }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
+          PRIVATE_REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
           CALLBACK_URL: ${{ secrets.QRANK_CALLBACK_URL }}
         run: |
@@ -63,4 +72,6 @@ jobs:
             --job-id "${{ github.event.inputs.job_id }}" \
             --pdf-url "${{ github.event.inputs.pdf_url }}" \
             --total-pages "${{ github.event.inputs.total_pages }}" \
-            --start-page "${{ github.event.inputs.start_page }}"
+            --start-page "${{ github.event.inputs.start_page }}" \
+            --chunk-size "${{ github.event.inputs.chunk_size || '150' }}" \
+            --branch "${{ github.event.inputs.branch }}"
