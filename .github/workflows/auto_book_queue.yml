@@ -1,0 +1,66 @@
+name: Automated Book Queue Pipeline (AIRstudy)
+
+# Automatically monitors incoming_books/ for newly uploaded NEET/JEE textbooks.
+# Sequentially extracts, classifies, and uploads questions into Backblaze B2 & Turso DB.
+# Enforces strict 1-job-at-a-time concurrency to guarantee no hosted runner saturation or timeouts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'QRank branch to run code from'
+        required: false
+        default: 'feature/air-study-qmatch-upgrade'
+  schedule:
+    # Runs every 30 minutes to check if user dropped new books
+    - cron: '*/30 * * * *'
+  push:
+    paths:
+      - 'incoming_books/**'
+
+# Guarantee sequential execution: exactly ONE job runs at a time across this pipeline
+concurrency:
+  group: auto_book_queue_pipeline
+  cancel-in-progress: false
+
+jobs:
+  process_queue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Private QRank Repo
+        uses: actions/checkout@v4
+        with:
+          repository: TigerMask1/Qrank
+          ref: ${{ github.event.inputs.branch || 'feature/air-study-qmatch-upgrade' }}
+          token: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
+          lfs: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Ingestion Dependencies
+        run: |
+          pip install --quiet PyMuPDF Pillow google-genai boto3 requests pypdf python-dotenv
+
+      - name: Execute Autonomous Queue Cycle
+        env:
+          GEMINI_MODEL: 'gemini-3.5-flash-lite'
+          GEMINI_FALLBACK_MODEL: 'gemini-3.1-flash-lite'
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          B2_REGION: ${{ secrets.B2_REGION || 'eu-central-003' }}
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
+          PRIVATE_REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
+          GITHUB_CDN_REPO: 'TigerMask1/Qrank-CDN'
+          GITHUB_BRANCH: ${{ github.event.inputs.branch || 'feature/air-study-qmatch-upgrade' }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          CALLBACK_URL: ${{ secrets.QRANK_CALLBACK_URL }}
+        run: |
+          python3 scripts/auto_book_queue.py
