@@ -18,9 +18,9 @@ on:
     paths:
       - 'incoming_books/**'
 
-# Guarantee sequential execution: exactly ONE job runs at a time across this pipeline
+# Concurrency scoped per book to allow up to 10 books running concurrently
 concurrency:
-  group: auto_book_queue_pipeline
+  group: auto_book_queue_${{ github.event.inputs.job_id || github.ref }}
   cancel-in-progress: false
 
 jobs:
