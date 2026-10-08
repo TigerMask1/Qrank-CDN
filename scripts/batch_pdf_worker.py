@@ -341,9 +341,11 @@ def process_single_pdf(file_target: str, args):
                     if ok:
                         total_extracted += 1
 
-        if args.callback_url:
-            post_callback(args.callback_url, args.callback_secret, {
-                "job_id": args.job_id,
+        callback_url = getattr(args, "callback_url", None)
+        callback_secret = getattr(args, "callback_secret", None)
+        if callback_url:
+            post_callback(callback_url, callback_secret, {
+                "job_id": getattr(args, "job_id", "batch"),
                 "processed_pages": page_num,
                 "total_pages": end_p,
                 "extracted_questions_count": total_extracted,
@@ -354,9 +356,9 @@ def process_single_pdf(file_target: str, args):
 
     print(f"=== Chunk Complete: Pages {start_p + 1} to {end_p}. Total Questions in chunk: {total_extracted} ===")
 
-    if end_p >= doc_len and str(args.delete_on_complete).lower() in ("true", "1", "yes"):
+    if end_p >= doc_len and str(getattr(args, "delete_on_complete", "false")).lower() in ("true", "1", "yes"):
         print(f"=== Document Fully Completed! All {doc_len} pages processed. ===")
         if os.path.exists(file_target):
-            delete_processed_pdf(file_target, args.branch)
+            delete_processed_pdf(file_target, getattr(args, "branch", "feature/air-study-qmatch-upgrade"))
 
     return total_extracted

@@ -41,6 +41,9 @@ class QueueArgs:
         self.delete_on_complete = delete_on_complete
         self.job_id = None
         self.pdf_url = None
+        self.callback_url = os.getenv("CALLBACK_URL", "")
+        self.callback_secret = os.getenv("CALLBACK_SECRET", "")
+        self.auto_chain = False
 
 def init_claim_table():
     """Initializes the concurrency claims table in Turso DB."""
