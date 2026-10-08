@@ -31,11 +31,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - name: Checkout QRank-CDN Engine Scripts
-        uses: actions/checkout@v4
-        with:
-          path: cdn_engine
-
       - name: Checkout Private QRank Repo
         uses: actions/checkout@v4
         with:
@@ -43,6 +38,11 @@ jobs:
           ref: ${{ github.event.inputs.branch || 'feature/air-study-qmatch-upgrade' }}
           token: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
           lfs: true
+
+      - name: Checkout QRank-CDN Engine Scripts
+        uses: actions/checkout@v4
+        with:
+          path: cdn_engine
 
       - name: Sync Robust Parallel Engine Scripts
         run: |
