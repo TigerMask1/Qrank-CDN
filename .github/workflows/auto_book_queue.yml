@@ -1,8 +1,11 @@
 name: Automated Book Queue Pipeline (AIRstudy)
 
 # Automatically monitors incoming_books/ for newly uploaded NEET/JEE textbooks.
-# Sequentially extracts, classifies, and uploads questions into Backblaze B2 & Turso DB.
-# Enforces strict 1-job-at-a-time concurrency to guarantee no hosted runner saturation or timeouts.
+# Extracts, classifies, and uploads questions into Backblaze B2 & Turso DB.
+# Supports parallel runs via atomic chunk claims:
+#   - Runner 1 claims Pages 0-150.
+#   - Runner 2 (triggered concurrently) immediately claims Pages 151-300.
+# Strictly conserves Turso DB read quota (1-2 rows read per 45-minute chunk).
 
 on:
   workflow_dispatch:
@@ -12,21 +15,27 @@ on:
         required: false
         default: 'feature/air-study-qmatch-upgrade'
   schedule:
-    # Runs every 30 minutes to check if user dropped new books
-    - cron: '*/30 * * * *'
+    # 2-hour pulse in case runner was interrupted or network dropped
+    - cron: '0 */2 * * *'
   push:
     paths:
       - 'incoming_books/**'
 
-# Concurrency scoped per book to allow up to 10 books running concurrently
+# Scoped per run_id so multiple runs can execute concurrently in parallel without cancelling each other
 concurrency:
-  group: auto_book_queue_${{ github.event.inputs.job_id || github.ref }}
+  group: auto_book_queue_${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
   process_queue:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
+      - name: Checkout QRank-CDN Engine Scripts
+        uses: actions/checkout@v4
+        with:
+          path: cdn_engine
+
       - name: Checkout Private QRank Repo
         uses: actions/checkout@v4
         with:
@@ -34,6 +43,12 @@ jobs:
           ref: ${{ github.event.inputs.branch || 'feature/air-study-qmatch-upgrade' }}
           token: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}
           lfs: true
+
+      - name: Sync Robust Parallel Engine Scripts
+        run: |
+          mkdir -p scripts
+          cp -f cdn_engine/scripts/auto_book_queue.py scripts/auto_book_queue.py
+          cp -f cdn_engine/scripts/batch_pdf_worker.py scripts/batch_pdf_worker.py
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
