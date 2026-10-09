@@ -6,6 +6,8 @@ name: Automated Book Queue Pipeline (AIRstudy)
 #   - Runner 1 claims Pages 0-150.
 #   - Runner 2 (triggered concurrently) immediately claims Pages 151-300.
 # Strictly conserves Turso DB read quota (1-2 rows read per 45-minute chunk).
+# Self-healing concurrency pool maintains 10 active runners until books are 100% complete.
+# Case A Multi-Bucket Support: uploads new questions directly into Bucket 2.
 
 on:
   workflow_dispatch:
@@ -25,6 +27,10 @@ on:
 concurrency:
   group: auto_book_queue_${{ github.run_id }}
   cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
 
 jobs:
   process_queue:
@@ -49,6 +55,7 @@ jobs:
           mkdir -p scripts
           cp -f cdn_engine/scripts/auto_book_queue.py scripts/auto_book_queue.py
           cp -f cdn_engine/scripts/batch_pdf_worker.py scripts/batch_pdf_worker.py
+          if [ -f cdn_engine/b2_storage.py ]; then cp -f cdn_engine/b2_storage.py b2_storage.py; fi
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -65,11 +72,20 @@ jobs:
           GEMINI_FALLBACK_MODEL: 'gemini-3.1-flash-lite'
           GEMMA_FALLBACK_MODEL: 'gemma-4-31b-it'
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          # Primary B2 (Bucket 1 - Archive)
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
           B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
           B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
           B2_REGION: ${{ secrets.B2_REGION || 'eu-central-003' }}
+          # Secondary B2 (Bucket 2 - Case A Active Upload Pool)
+          B2_KEY_ID_2: ${{ secrets.B2_KEY_ID_2 }}
+          B2_APP_KEY_2: ${{ secrets.B2_APP_KEY_2 }}
+          B2_BUCKET_NAME_2: ${{ secrets.B2_BUCKET_NAME_2 }}
+          B2_ENDPOINT_2: ${{ secrets.B2_ENDPOINT_2 }}
+          B2_REGION_2: ${{ secrets.B2_REGION_2 || 'eu-central-003' }}
+          TARGET_CONCURRENCY: 10
+          # Turso Database & GitHub Tokens
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.PRIVATE_REPO_PAT || secrets.GITHUB_TOKEN }}

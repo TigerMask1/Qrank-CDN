@@ -2,9 +2,12 @@
 AIRstudy / QRank — Parallel & Autonomous Book Queue Coordinator.
 Permits multiple runners to execute simultaneously without colliding:
 - Runner 1 claims Pages 0-150.
-- Runner 2 (triggered at the same time or while Runner 1 is on page 12) immediately claims Pages 151-300!
+- Runner 2 (triggered concurrently) immediately claims Pages 151-300.
 - Minimal Turso DB reads (1-2 rows per 45-minute chunk run, strictly conserving read quota).
 - Once a book is 100% complete, automatically removes it from git and updates catalog.
+- Self-Healing Concurrency Pool: continuously monitors active GitHub Actions runs
+  and maintains 10 concurrent parallel runners 24/7.
+- Case A Multi-Bucket Support: tracks in-memory upload counts and records bucket pool stats.
 """
 import os
 import sys
@@ -46,7 +49,7 @@ class QueueArgs:
         self.auto_chain = False
 
 def init_claim_table():
-    """Initializes the concurrency claims table in Turso DB."""
+    """Initializes the concurrency claims and bucket pools tables in Turso DB."""
     schema = """
     CREATE TABLE IF NOT EXISTS book_chunk_claims (
         id TEXT PRIMARY KEY,
@@ -62,6 +65,15 @@ def init_claim_table():
         UNIQUE(file_name, start_page)
     );
     CREATE INDEX IF NOT EXISTS idx_chunk_claims_file ON book_chunk_claims(file_name, start_page);
+
+    CREATE TABLE IF NOT EXISTS b2_bucket_pools (
+        bucket_name TEXT PRIMARY KEY,
+        account_tag TEXT,
+        file_count INTEGER DEFAULT 0,
+        max_files INTEGER DEFAULT 100000,
+        status TEXT DEFAULT 'active',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     """
     for stmt in schema.split(";"):
         s = stmt.strip()
@@ -70,6 +82,24 @@ def init_claim_table():
                 execute_query(s)
             except Exception:
                 pass
+
+    # Record Bucket 1 and Bucket 2 pool metadata (0 extra reads, INSERT OR IGNORE)
+    try:
+        b1 = os.getenv("B2_BUCKET_NAME") or os.getenv("B2_BUCKET", "AIRstudy")
+        b2 = os.getenv("B2_BUCKET_NAME_2", "")
+        # Bucket 1: Historical archive (~1.17 lakh questions, full)
+        execute_query(
+            "INSERT OR IGNORE INTO b2_bucket_pools (bucket_name, account_tag, file_count, max_files, status) VALUES (?, 'account_1', 117000, 100000, 'full')",
+            (b1,)
+        )
+        if b2:
+            # Bucket 2: Active upload target (0 up to 100,000 files)
+            execute_query(
+                "INSERT OR IGNORE INTO b2_bucket_pools (bucket_name, account_tag, file_count, max_files, status) VALUES (?, 'account_2', 0, 100000, 'active')",
+                (b2,)
+            )
+    except Exception as be:
+        print(f"[Bucket Pool Init Note]: {be}")
 
 def get_pending_books():
     """Scans incoming_books/ and root directory for pending PDF books (Zero DB reads)."""
@@ -106,8 +136,40 @@ def update_catalog_on_completion(book_name: str, total_pages: int):
     except Exception as e:
         print(f"[Catalog Error]: {e}")
 
+def get_active_runner_count():
+    """
+    Queries GitHub Actions API for currently active runs of auto_book_queue.yml.
+    Consumes ZERO Turso DB rows.
+    """
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("PRIVATE_REPO_PAT")
+    cdn_repo = os.getenv("GITHUB_CDN_REPO", "TigerMask1/Qrank-CDN")
+    if not token:
+        return 1
+
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "AIRstudy-Pool-Manager"
+    }
+
+    url_in_progress = f"https://api.github.com/repos/{cdn_repo}/actions/workflows/auto_book_queue.yml/runs?status=in_progress&per_page=30"
+    url_queued = f"https://api.github.com/repos/{cdn_repo}/actions/workflows/auto_book_queue.yml/runs?status=queued&per_page=30"
+    active = 0
+    try:
+        r1 = requests.get(url_in_progress, headers=headers, timeout=10)
+        if r1.status_code == 200:
+            active += len(r1.json().get("workflow_runs", []))
+        r2 = requests.get(url_queued, headers=headers, timeout=10)
+        if r2.status_code == 200:
+            active += len(r2.json().get("workflow_runs", []))
+    except Exception as e:
+        print(f"[Pool Manager Warning] Could not query active runs: {e}")
+        return 1
+
+    return active
+
 def trigger_next_queue_cycle(branch: str):
-    """Dispatches the next run of the queue workflow on GitHub Actions."""
+    """Dispatches one workflow run of the queue pipeline on GitHub Actions."""
     token = os.getenv("GITHUB_TOKEN") or os.getenv("PRIVATE_REPO_PAT")
     cdn_repo = os.getenv("GITHUB_CDN_REPO", "TigerMask1/Qrank-CDN")
     if not token:
@@ -116,7 +178,8 @@ def trigger_next_queue_cycle(branch: str):
 
     headers = {
         "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "AIRstudy-Pool-Manager"
     }
 
     url = f"https://api.github.com/repos/{cdn_repo}/actions/workflows/auto_book_queue.yml/dispatches"
@@ -129,7 +192,7 @@ def trigger_next_queue_cycle(branch: str):
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=20)
         if res.status_code in [200, 204]:
-            print(f"[Queue] Successfully dispatched next cycle on {cdn_repo}")
+            print(f"[Queue] Successfully dispatched cycle on {cdn_repo}")
             return True
         else:
             print(f"[Queue Dispatch Note]: Response {res.status_code}")
@@ -137,6 +200,28 @@ def trigger_next_queue_cycle(branch: str):
         print(f"[Queue Dispatch Error]: {e}")
 
     return False
+
+def replenish_runner_pool(target: int = 10, branch: str = "feature/air-study-qmatch-upgrade"):
+    """
+    Ensures that exactly `target` concurrent parallel runners stay alive.
+    If 9 runners crashed or only 1 is active, dispatches runners back up to `target`.
+    """
+    remaining = get_pending_books()
+    if not remaining:
+        print("🎉 [Pool Manager] All incoming books are 100% completed. Runner pool gracefully standing down.")
+        return
+
+    active = get_active_runner_count()
+    # Current runner is about to finish, so effective active pool = (active - 1)
+    effective_active = max(0, active - 1)
+    needed = target - effective_active
+    print(f"\n📊 [Pool Manager] Active runners: {active}. Target concurrency: {target}. Spawning {max(0, needed)} new runners to sustain 10 concurrent slots.")
+
+    spawn_count = max(1, min(needed, target))
+    for i in range(spawn_count):
+        trigger_next_queue_cycle(branch=branch)
+        if i < spawn_count - 1:
+            time.sleep(2)
 
 def claim_next_chunk(pending_books, chunk_size=150, runner_id=None):
     """
@@ -209,12 +294,10 @@ def claim_next_chunk(pending_books, chunk_size=150, runner_id=None):
                 print(f"🎯 [Parallel Claim SUCCESS] Claimed pages {next_start + 1} to {next_end} of '{file_name}'!")
                 return book_path, next_start, next_end, total_pages, claim_id
             except Exception as coll_err:
-                # Race condition: Another parallel runner claimed at the identical millisecond
                 print(f"[Claim Race Detected] Another runner claimed slice simultaneously: {coll_err}. Trying next...")
                 continue
 
         # 5. If this book is already fully claimed (max_claimed >= total_pages):
-        # Check if all chunks have finished processing (1 single row read)
         comp_rows = execute_query(
             "SELECT COUNT(*) as pending_cnt FROM book_chunk_claims WHERE file_name = ? AND status != 'completed'",
             (file_name,)
@@ -239,22 +322,33 @@ def run_queue_pipeline():
     init_turso_schema()
     warm_taxonomy_cache()
 
-    pending_books = get_pending_books()
-    if not pending_books:
-        print("🎉 [AIRstudy Queue] No pending books found in 'incoming_books/' or root.")
-        return
-
-    print(f"[AIRstudy Queue] Found {len(pending_books)} books in queue.")
+    target_concurrency = int(os.getenv("TARGET_CONCURRENCY", "10"))
     runner_id = f"run_{os.getenv('GITHUB_RUN_ID', str(int(time.time())))}"
+    branch = os.getenv("GITHUB_BRANCH", "feature/air-study-qmatch-upgrade")
 
-    book_path, start_p, end_p, total_pages, claim_id = claim_next_chunk(
-        pending_books,
-        chunk_size=150,
-        runner_id=runner_id
-    )
+    # Retry loop to find an unclaimed chunk if other runners are currently active
+    book_path = None
+    start_p, end_p, total_pages, claim_id = 0, 0, 0, None
+    for attempt in range(3):
+        pending_books = get_pending_books()
+        if not pending_books:
+            print("🎉 [AIRstudy Queue] No pending books found in 'incoming_books/' or root.")
+            return
+
+        book_path, start_p, end_p, total_pages, claim_id = claim_next_chunk(
+            pending_books,
+            chunk_size=150,
+            runner_id=runner_id
+        )
+        if book_path:
+            break
+        print(f"⏳ [Runner {runner_id}] All chunks currently claimed in-flight. Waiting 20s (attempt {attempt + 1}/3)...")
+        time.sleep(20)
 
     if not book_path:
-        print("🎉 [AIRstudy Queue] All pending books are fully claimed or completed by active runners!")
+        print("🎉 [AIRstudy Queue] All pending books are fully claimed across active runners.")
+        # Ensure pool remains populated if more work arrives
+        replenish_runner_pool(target=target_concurrency, branch=branch)
         return
 
     file_name = os.path.basename(book_path)
@@ -266,7 +360,7 @@ def run_queue_pipeline():
         start_page=start_p,
         chunk_size=(end_p - start_p),
         total_pages=total_pages,
-        branch=os.getenv("GITHUB_BRANCH", "feature/air-study-qmatch-upgrade"),
+        branch=branch,
         delete_on_complete=False
     )
     args.job_id = job_id
@@ -274,54 +368,69 @@ def run_queue_pipeline():
 
     print(f"\n🚀 [Runner {runner_id}] Processing: '{file_name}' (Pages {start_p + 1} to {end_p} of {total_pages})")
 
-    extracted = process_single_pdf(book_path, args)
-
-    # 1. Mark this chunk as completed
-    execute_query(
-        "UPDATE book_chunk_claims SET status = 'completed', extracted_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (extracted, claim_id)
-    )
-
-    # 2. Record in batch_pdf_jobs for cataloging and backward compatibility
     try:
+        extracted = process_single_pdf(book_path, args)
+
+        # 1. Mark this chunk as completed
         execute_query(
-            """
-            INSERT INTO batch_pdf_jobs (
-                job_id, file_name, file_url, total_pages, processed_pages, extracted_questions_count, status, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)
-            ON CONFLICT(job_id) DO UPDATE SET
-                processed_pages = excluded.processed_pages,
-                extracted_questions_count = excluded.extracted_questions_count,
-                status = excluded.status,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (job_id, file_name, book_path, total_pages, end_p, extracted)
+            "UPDATE book_chunk_claims SET status = 'completed', extracted_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (extracted, claim_id)
         )
-    except Exception as db_e:
-        print(f"[Turso Jobs Update Note]: {db_e}")
 
-    print(f"\n✅ [Runner {runner_id}] Finished Chunk {start_p + 1}-{end_p}. Extracted {extracted} questions.")
+        # 2. Record in batch_pdf_jobs for cataloging and backward compatibility
+        try:
+            execute_query(
+                """
+                INSERT INTO batch_pdf_jobs (
+                    job_id, file_name, file_url, total_pages, processed_pages, extracted_questions_count, status, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'completed', CURRENT_TIMESTAMP)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    processed_pages = excluded.processed_pages,
+                    extracted_questions_count = excluded.extracted_questions_count,
+                    status = excluded.status,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (job_id, file_name, book_path, total_pages, end_p, extracted)
+            )
+        except Exception as db_e:
+            print(f"[Turso Jobs Update Note]: {db_e}")
 
-    # 3. Check if all chunks for this book are completed
-    comp_rows = execute_query(
-        "SELECT COUNT(*) as pending_cnt FROM book_chunk_claims WHERE file_name = ? AND status != 'completed'",
-        (file_name,)
-    )
-    pending_cnt = int(comp_rows[0]["pending_cnt"]) if comp_rows else 0
-    if pending_cnt == 0:
-        # Check if entire page range covered
-        max_rows = execute_query("SELECT MAX(end_page) as max_e FROM book_chunk_claims WHERE file_name = ?", (file_name,))
-        max_e = int(max_rows[0]["max_e"]) if max_rows and max_rows[0].get("max_e") else 0
-        if max_e >= total_pages and total_pages > 0:
-            print(f"🎉 [Book Complete] All chunks of '{file_name}' ({total_pages}/{total_pages} pages) are 100% finished!")
-            auto_delete_book_from_git(book_path, branch=args.branch)
-            update_catalog_on_completion(file_name, total_pages)
+        # 3. Flush uploaded file count to b2_bucket_pools (0 row reads, 1 write)
+        try:
+            from b2_storage import get_session_upload_count
+            session_cnt = get_session_upload_count()
+            active_b = os.getenv("B2_BUCKET_NAME_2") or os.getenv("B2_BUCKET_NAME") or "AIRstudy"
+            if session_cnt > 0:
+                execute_query(
+                    "UPDATE b2_bucket_pools SET file_count = file_count + ?, updated_at = CURRENT_TIMESTAMP WHERE bucket_name = ?",
+                    (session_cnt, active_b)
+                )
+                print(f"[Bucket Pool] Recorded {session_cnt} newly uploaded questions in pool '{active_b}'.")
+        except Exception as b_e:
+            print(f"[Bucket Pool Flush Note]: {b_e}")
 
-    # 4. Trigger next cycle to keep the pipeline moving if books remain
-    remaining = get_pending_books()
-    if remaining:
-        time.sleep(10)
-        trigger_next_queue_cycle(branch=args.branch)
+        print(f"\n✅ [Runner {runner_id}] Finished Chunk {start_p + 1}-{end_p}. Extracted {extracted} questions.")
+
+        # 4. Check if all chunks for this book are completed
+        comp_rows = execute_query(
+            "SELECT COUNT(*) as pending_cnt FROM book_chunk_claims WHERE file_name = ? AND status != 'completed'",
+            (file_name,)
+        )
+        pending_cnt = int(comp_rows[0]["pending_cnt"]) if comp_rows else 0
+        if pending_cnt == 0:
+            max_rows = execute_query("SELECT MAX(end_page) as max_e FROM book_chunk_claims WHERE file_name = ?", (file_name,))
+            max_e = int(max_rows[0]["max_e"]) if max_rows and max_rows[0].get("max_e") else 0
+            if max_e >= total_pages and total_pages > 0:
+                print(f"🎉 [Book Complete] All chunks of '{file_name}' ({total_pages}/{total_pages} pages) are 100% finished!")
+                auto_delete_book_from_git(book_path, branch=args.branch)
+                update_catalog_on_completion(file_name, total_pages)
+
+    except Exception as err:
+        print(f"❌ [Runner Error during chunk processing]: {err}")
+    finally:
+        # ALWAYS self-replenish to maintain exactly 10 parallel runners!
+        time.sleep(5)
+        replenish_runner_pool(target=target_concurrency, branch=args.branch)
 
 if __name__ == "__main__":
     run_queue_pipeline()
